@@ -1,0 +1,16 @@
+# games.csv pesa 389 MB — la app usa games_meta_subset.csv en su lugar
+games.csv
+
+# Respaldo del scrape original (con duplicados) — solo referencia local
+old_scrape_backup/
+
+# Entorno virtual y cachés de Python
+.venv/
+__pycache__/
+*.pyc
+
+# Config local de herramientas
+.claude/
+
+# Se regenera solo al correr la app
+chart7_animation.gif
