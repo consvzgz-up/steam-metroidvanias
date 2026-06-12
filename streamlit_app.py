@@ -7,6 +7,7 @@
 import os
 import re
 from collections import Counter
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -15,8 +16,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-import seaborn as sns
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
 # -----------------------------------------------------------------------------
 # Configuración general
@@ -26,6 +28,64 @@ st.set_page_config(
     page_icon="🗺️",
     layout="wide",
 )
+
+# -----------------------------------------------------------------------------
+# Estilo global — tema oscuro minimalista (paleta inspirada en dashboards
+# tipo Frame.io: fondo grafito, tarjetas con borde sutil, acentos saturados)
+# -----------------------------------------------------------------------------
+ACCENT = {
+    'blue':   '#4FC1FF',
+    'orange': '#FFA13D',
+    'pink':   '#F2589C',
+    'purple': '#9D5CF5',
+    'red':    '#FF5C5C',
+    'green':  '#39D98A',
+}
+
+CUSTOM_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"], [data-testid="stAppViewContainer"] * {
+    font-family: 'Inter', 'Source Sans Pro', sans-serif;
+}
+h1, h2, h3 { letter-spacing: -0.02em; font-weight: 700; }
+
+/* Tarjetas de métricas */
+[data-testid="stMetric"] {
+    background: #1C1F26;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 14px;
+    padding: 16px 18px 12px 18px;
+}
+[data-testid="stMetricLabel"] p {
+    color: #9AA0AB;
+    font-size: 0.82rem;
+    font-weight: 500;
+}
+[data-testid="stMetricValue"] {
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+}
+[data-testid="stMetricDelta"] { font-size: 0.85rem; font-weight: 600; }
+
+/* Pestañas minimalistas */
+[data-baseweb="tab-list"] { gap: 4px; }
+[data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+    padding: 6px 14px;
+}
+
+/* Contenedor principal más compacto */
+[data-testid="stAppViewBlockContainer"],
+.block-container { padding-top: 2.2rem; }
+
+/* Separadores sutiles */
+hr { border-color: rgba(255, 255, 255, 0.08); }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 GAMES_CSV_PATH = os.path.join(APP_DIR, "games.csv")
@@ -145,9 +205,6 @@ LANG_TO_ISO = {
     'swedish':    'SWE',   'czech':     'CZE',  'portuguese':'PRT',
     'finnish':    'FIN',   'dutch':     'NLD',  'hungarian': 'HUN',
 }
-
-WORLD_GEOJSON_URL = ("https://raw.githubusercontent.com/datasets/"
-                     "geo-boundaries-world-110m/master/countries.geojson")
 
 PLAYTIME_BINS = [0, 5, 15, 30, 60, np.inf]
 PLAYTIME_LABELS = ['early drop (<5h)', 'short run (5–15h)',
@@ -274,7 +331,13 @@ def friction_crosstabs(df):
         for tag in FRICTION_TAGS
     }).T
     band_totals = neg_df.groupby('playtime_band', observed=True).size()
-    crosstab_pct = (crosstab.div(band_totals, axis=1) * 100).round(1)
+    # Con el filtro de juegos una banda puede quedar vacía: se reindexa a las
+    # 5 bandas para que heatmap y animación siempre tengan ejes completos.
+    crosstab = (crosstab.reindex(columns=PLAYTIME_LABELS)
+                .fillna(0).astype(int))
+    band_totals = band_totals.reindex(PLAYTIME_LABELS).fillna(0).astype(int)
+    crosstab_pct = (crosstab
+                    .div(band_totals.replace(0, np.nan), axis=1) * 100).round(1)
     return crosstab, crosstab_pct, band_totals
 
 
@@ -294,28 +357,115 @@ def negative_phrases(df, n=3, top_k=25):
 
 
 # -----------------------------------------------------------------------------
-# Visualizaciones (Fase 3 del notebook) — misma lógica, una función por gráfico
+# Helpers de Plotly — estilo compartido por todos los gráficos interactivos
+# -----------------------------------------------------------------------------
+def hex_to_rgba(hex_color, alpha):
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f'rgba({r},{g},{b},{alpha})'
+
+
+def style_fig(fig, height=440, title=None):
+    """Aplica el tema oscuro minimalista común a una figura de Plotly."""
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='Inter, Source Sans Pro, sans-serif',
+                  size=12, color='#C9CDD6'),
+        margin=dict(l=10, r=10, t=56 if title else 28, b=10),
+        height=height,
+        hoverlabel=dict(bgcolor='#23262E', bordercolor='rgba(255,255,255,0.15)',
+                        font_size=12),
+        legend=dict(bgcolor='rgba(0,0,0,0)'),
+    )
+    if title:
+        fig.update_layout(title=dict(text=title, x=0, xanchor='left',
+                                     font=dict(size=15, color='#E8EAED')))
+    fig.update_xaxes(gridcolor='rgba(255,255,255,0.06)', zeroline=False)
+    fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)', zeroline=False)
+    return fig
+
+
+def mini_cumulative_chart(series, color, kind, hover_label, date_fmt='%b %Y'):
+    """Mini gráfico acumulado para las tarjetas de métricas (estilo
+    'Cumulative Stats'): barras, línea o área según el selector."""
+    x = series.index
+    y = series.values
+    hover = ('%{x|' + date_fmt + '}: %{y:,.0f} ' + hover_label
+             + '<extra></extra>')
+    if kind == 'Barras':
+        trace = go.Bar(x=x, y=y, marker=dict(color=color, cornerradius=2),
+                       hovertemplate=hover)
+    elif kind == 'Área':
+        trace = go.Scatter(x=x, y=y, mode='lines',
+                           line=dict(color=color, width=2),
+                           fill='tozeroy', fillcolor=hex_to_rgba(color, 0.25),
+                           hovertemplate=hover)
+    else:  # Línea
+        trace = go.Scatter(x=x, y=y, mode='lines',
+                           line=dict(color=color, width=2.4),
+                           hovertemplate=hover)
+    fig = go.Figure(trace)
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        height=180,
+        margin=dict(l=0, r=0, t=8, b=0),
+        showlegend=False,
+        hoverlabel=dict(bgcolor='#23262E', font_size=11),
+        bargap=0.25,
+    )
+    fig.update_xaxes(showgrid=False, tickfont=dict(size=9, color='#9AA0AB'),
+                     zeroline=False)
+    fig.update_yaxes(showgrid=False, tickfont=dict(size=9, color='#9AA0AB'),
+                     zeroline=False, nticks=4)
+    return fig
+
+
+def gaussian_kde_curve(values, grid):
+    """KDE gaussiana con regla de Scott (equivalente a sns.kdeplot) en NumPy
+    puro — evita depender de scipy solo para este gráfico."""
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    bandwidth = values.std(ddof=1) * n ** (-1 / 5)
+    if bandwidth == 0 or n < 2:
+        return np.zeros_like(grid)
+    diffs = (grid[:, None] - values[None, :]) / bandwidth
+    return np.exp(-0.5 * diffs ** 2).sum(axis=1) / (n * bandwidth * np.sqrt(2 * np.pi))
+
+
+# -----------------------------------------------------------------------------
+# Visualizaciones (Fase 3 del notebook) — misma lógica, ahora interactivas
+# con Plotly (tooltips, zoom y paneo). Las versiones Matplotlib/Seaborn del
+# rúbrico viven en el notebook de Colab enlazado en Metodología.
 # -----------------------------------------------------------------------------
 def chart_playtime_histogram(df):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
-    fig.suptitle('Playtime distribution at review — recommended vs. not recommended',
-                 fontsize=13, fontweight='bold', y=1.01)
-    for ax, (rec, label, color) in zip(axes, [
-        (False, 'Not recommended', '#e05c5c'),
-        (True,  'Recommended',     '#5b8dd9'),
-    ]):
+    fig = go.Figure()
+    for rec, label, color in [
+        (False, 'No recomendado', ACCENT['red']),
+        (True,  'Recomendado',    ACCENT['blue']),
+    ]:
         data = df[df['recommended'] == rec]['playtime_at_review_hrs']
-        data_capped = data[data <= 100]
-        ax.hist(data_capped, bins=40, color=color, edgecolor='white', linewidth=0.4)
-        ax.axvline(data.median(), color='black', linestyle='--', linewidth=1.2,
-                   label=f'Median: {data.median():.1f}h')
-        ax.set_title(label, fontsize=11)
-        ax.set_xlabel('Playtime at review (hours)')
-        ax.set_ylabel('Number of reviews')
-        ax.legend(fontsize=9)
-        ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+        fig.add_trace(go.Histogram(
+            x=data[data <= 100], nbinsx=40, name=label,
+            marker_color=color, opacity=0.72,
+            hovertemplate='%{x} h → %{y} reseñas<extra>' + label + '</extra>',
+        ))
+        fig.add_vline(
+            x=data.median(), line_dash='dash', line_color=color, line_width=1.4,
+            annotation_text=f'mediana: {data.median():.1f}h',
+            annotation_font=dict(size=10, color=color),
+            annotation_position='top right' if rec else 'top left',
+        )
+    fig.update_layout(
+        barmode='overlay',
+        xaxis_title='Horas jugadas al reseñar (≤100h)',
+        yaxis_title='Número de reseñas',
+        legend=dict(orientation='h', y=1.08),
+    )
+    return style_fig(fig, title='Distribución de horas jugadas — recomendado vs. no recomendado')
 
 
 def chart_negative_rate_by_band(df):
@@ -324,20 +474,28 @@ def chart_negative_rate_by_band(df):
         negative=('recommended', lambda x: (~x).sum())
     ).assign(neg_rate=lambda d: (d.negative / d.total * 100).round(1))
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bars = ax.bar(band_stats.index, band_stats['neg_rate'],
-                  color=['#e05c5c', '#e8845c', '#e8b45c', '#8db87a', '#5b8dd9'],
-                  edgecolor='white', linewidth=0.5)
-    for bar, val in zip(bars, band_stats['neg_rate']):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                f'{val}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
-    ax.set_title('Negative review rate by playtime band', fontsize=13, fontweight='bold')
-    ax.set_xlabel('Playtime at review')
-    ax.set_ylabel('Negative review rate (%)')
-    ax.set_ylim(0, max(55, band_stats['neg_rate'].max() + 5))
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+    fig = go.Figure(go.Bar(
+        x=band_stats.index.astype(str),
+        y=band_stats['neg_rate'],
+        marker=dict(
+            color=[ACCENT['red'], ACCENT['orange'], '#FFC34D',
+                   ACCENT['green'], ACCENT['blue']],
+            cornerradius=6,
+        ),
+        text=[f'{v}%' for v in band_stats['neg_rate']],
+        textposition='outside',
+        textfont=dict(size=13, color='#E8EAED'),
+        customdata=band_stats[['negative', 'total']].values,
+        hovertemplate=('<b>%{x}</b><br>%{y}% negativas<br>'
+                       '%{customdata[0]} de %{customdata[1]} reseñas'
+                       '<extra></extra>'),
+    ))
+    fig.update_layout(
+        xaxis_title='Horas jugadas al reseñar',
+        yaxis_title='Tasa de reseñas negativas (%)',
+        yaxis_range=[0, max(55, band_stats['neg_rate'].max() + 8)],
+    )
+    return style_fig(fig, title='Tasa de reseñas negativas por banda de horas')
 
 
 CUMULATIVE_GAMES = [
@@ -351,80 +509,85 @@ CUMULATIVE_GAMES = [
 
 
 def chart_abandonment_curves(df):
-    fig, ax = plt.subplots(figsize=(11, 6))
-    colors_line = ['#e05c5c', '#e8845c', '#5b8dd9', '#5bbdd9', '#2d6a4f', '#9b5de5']
+    fig = go.Figure()
+    colors_line = [ACCENT['red'], ACCENT['orange'], ACCENT['blue'],
+                   '#5BBDD9', ACCENT['green'], ACCENT['purple']]
     for game, color in zip(CUMULATIVE_GAMES, colors_line):
         game_df = df[df['game_name'] == game].copy()
+        if game_df.empty:
+            continue
         game_df = game_df.sort_values('playtime_at_review_hrs')
         game_df['cumulative_pct'] = (np.arange(1, len(game_df) + 1) / len(game_df)) * 100
-        ax.plot(game_df['playtime_at_review_hrs'].clip(upper=80),
-                game_df['cumulative_pct'],
-                label=game, color=color, linewidth=1.8, alpha=0.85)
-    for x, lbl in [(5, '<5h band'), (15, '15h'), (30, '30h')]:
-        ax.axvline(x, color='grey', linestyle=':', linewidth=1, alpha=0.6)
-        ax.text(x + 0.3, 2, lbl, fontsize=8, color='grey')
-    ax.set_title('Cumulative review accumulation by playtime\n'
-                 '(steeper early rise = more early-quitter reviews)',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Playtime at review (hours, capped at 80h)')
-    ax.set_ylabel('Cumulative % of reviews')
-    ax.legend(fontsize=9, loc='lower right')
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+        fig.add_trace(go.Scatter(
+            x=game_df['playtime_at_review_hrs'].clip(upper=80),
+            y=game_df['cumulative_pct'],
+            name=game, mode='lines',
+            line=dict(color=color, width=2),
+            hovertemplate='%{x:.1f} h → %{y:.0f}% de reseñas<extra>' + game + '</extra>',
+        ))
+    for x, lbl in [(5, '<5h'), (15, '15h'), (30, '30h')]:
+        fig.add_vline(x=x, line_dash='dot', line_color='rgba(255,255,255,0.25)',
+                      annotation_text=lbl,
+                      annotation_font=dict(size=10, color='#9AA0AB'),
+                      annotation_position='bottom right')
+    fig.update_layout(
+        xaxis_title='Horas jugadas al reseñar (tope 80h)',
+        yaxis_title='% acumulado de reseñas',
+        legend=dict(orientation='h', y=1.1),
+    )
+    return style_fig(
+        fig, height=480,
+        title='Acumulación de reseñas según horas jugadas '
+              '(subida temprana = más reseñas de abandono)')
 
 
 def chart_boxplot_sentiment(df):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sns.boxplot(
-        data=df[df['playtime_at_review_hrs'] <= 120],
-        x='recommended',
-        y='playtime_at_review_hrs',
-        hue='recommended',
-        palette={True: '#5b8dd9', False: '#e05c5c'},
-        width=0.45,
-        linewidth=1.2,
-        flierprops=dict(marker='o', markersize=2, alpha=0.3),
-        legend=False,
-        ax=ax,
+    data = df[df['playtime_at_review_hrs'] <= 120].copy()
+    data['sentimiento'] = np.where(data['recommended'],
+                                   'Recomendado', 'No recomendado')
+    fig = px.box(
+        data, x='sentimiento', y='playtime_at_review_hrs',
+        color='sentimiento',
+        color_discrete_map={'Recomendado': ACCENT['blue'],
+                            'No recomendado': ACCENT['red']},
+        category_orders={'sentimiento': ['No recomendado', 'Recomendado']},
+        points='outliers',
     )
-    ax.set_xticks([0, 1])
-    ax.set_xticklabels(['Not recommended', 'Recommended'])
-    ax.set_title('Playtime at review by sentiment\n(capped at 120h for readability)',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('')
-    ax.set_ylabel('Playtime at review (hours)')
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+    fig.update_traces(marker=dict(size=3, opacity=0.35), width=0.45,
+                      showlegend=False)
+    fig.update_layout(
+        xaxis_title='',
+        yaxis_title='Horas jugadas al reseñar',
+    )
+    return style_fig(fig, height=480,
+                     title='Horas jugadas según sentimiento (tope 120h)')
 
 
 def chart_friction_heatmap(crosstab_pct, band_totals):
-    data = crosstab_pct.copy()
-    data.index = [TAG_LABELS[t] for t in data.index]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.heatmap(
-        data,
-        annot=True,
-        fmt='.1f',
-        cmap='YlOrRd',
-        linewidths=0.4,
-        linecolor='white',
-        cbar_kws={'label': '% of negative reviews in band'},
-        ax=ax,
-    )
     # Denominadores visibles: N de reseñas negativas por banda
-    ax.set_xticklabels([f"{band}\n(N={band_totals[band]})"
-                        for band in data.columns], fontsize=8)
-    ax.set_title('Friction complaint themes by playtime band\n'
-                 '(% of English negative reviews per band mentioning each theme)',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Playtime at review')
-    ax.set_ylabel('')
-    ax.tick_params(axis='x', rotation=0)
-    ax.tick_params(axis='y', rotation=0)
-    plt.tight_layout()
-    return fig
+    x_labels = [f'{band}<br><span style="font-size:10px">N={band_totals[band]}</span>'
+                for band in crosstab_pct.columns]
+    y_labels = [TAG_LABELS[t] for t in crosstab_pct.index]
+    fig = px.imshow(
+        crosstab_pct.values,
+        x=x_labels, y=y_labels,
+        text_auto='.1f',
+        color_continuous_scale='YlOrRd',
+        aspect='auto',
+    )
+    fig.update_traces(
+        hovertemplate='<b>%{y}</b><br>%{x}<br>%{z:.1f}% de las negativas'
+                      '<extra></extra>')
+    fig.update_layout(
+        xaxis_title='Horas jugadas al reseñar',
+        coloraxis_colorbar=dict(title='% negativas<br>de la banda'),
+    )
+    fig.update_xaxes(side='bottom', gridcolor='rgba(0,0,0,0)')
+    fig.update_yaxes(gridcolor='rgba(0,0,0,0)')
+    return style_fig(
+        fig, height=460,
+        title='Temas de fricción × banda de horas '
+              '(% de reseñas negativas en inglés que mencionan cada tema)')
 
 
 KDE_GAMES = [
@@ -438,21 +601,31 @@ KDE_GAMES = [
 
 
 def chart_kde_playtime(df):
-    palette = ['#e05c5c', '#e8845c', '#e8c45c', '#5b8dd9', '#5bbdd9', '#9b5de5']
-    fig, ax = plt.subplots(figsize=(11, 5))
+    palette = [ACCENT['red'], ACCENT['orange'], '#E8C45C',
+               ACCENT['blue'], '#5BBDD9', ACCENT['purple']]
+    grid = np.linspace(0, 100, 400)
+    fig = go.Figure()
     for game, color in zip(KDE_GAMES, palette):
         game_data = df[df['game_name'] == game]['playtime_at_review_hrs']
         game_data = game_data[game_data <= 100]
-        sns.kdeplot(game_data, ax=ax, label=game, color=color,
-                    linewidth=2, fill=True, alpha=0.08)
-    ax.set_title('Playtime distribution shape by game\n(KDE — capped at 100h)',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Playtime at review (hours)')
-    ax.set_ylabel('Density')
-    ax.legend(fontsize=9)
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+        if len(game_data) < 2:
+            continue
+        density = gaussian_kde_curve(game_data, grid)
+        fig.add_trace(go.Scatter(
+            x=grid, y=density, name=game, mode='lines',
+            line=dict(color=color, width=2),
+            fill='tozeroy', fillcolor=hex_to_rgba(color, 0.08),
+            hovertemplate='%{x:.0f} h — densidad %{y:.4f}<extra>' + game + '</extra>',
+        ))
+    fig.update_layout(
+        xaxis_title='Horas jugadas al reseñar',
+        yaxis_title='Densidad',
+        legend=dict(orientation='h', y=1.1),
+        hovermode='x unified',
+    )
+    return style_fig(fig, height=460,
+                     title='Forma de la distribución de horas por juego '
+                           '(KDE — tope 100h)')
 
 
 @st.cache_data(show_spinner="Generando animación…")
@@ -488,40 +661,81 @@ def build_animation_gif(crosstab):
     return ANIMATION_GIF_PATH
 
 
-@st.cache_data(show_spinner="Construyendo mapa coroplético…")
-def build_choropleth(df):
-    """Mapa coroplético de reseñas negativas por idioma (cell 31)."""
-    import geopandas as gpd
+def chart_friction_animated(crosstab):
+    """Versión interactiva de la animación: barras de quejas con botón ▶
+    que recorre las bandas de horas (frames de Plotly)."""
+    anim_data = crosstab.T.copy()
+    anim_data.index = ['<5h', '5–15h', '15–30h', '30–60h', '>60h']
+    tag_cols = list(FRICTION_TAGS.keys())
+    long_df = (
+        anim_data[tag_cols]
+        .reset_index(names='banda')
+        .melt(id_vars='banda', var_name='tag', value_name='quejas')
+    )
+    long_df['Tema'] = long_df['tag'].map(TAG_LABELS_SHORT)
 
+    bar_colors = [ACCENT['red'], ACCENT['orange'], '#E8C45C',
+                  ACCENT['blue'], '#5BBDD9', ACCENT['purple']]
+    fig = px.bar(
+        long_df, x='quejas', y='Tema', color='Tema',
+        animation_frame='banda', orientation='h',
+        color_discrete_sequence=bar_colors,
+        range_x=[0, long_df['quejas'].max() * 1.15],
+        text='quejas',
+    )
+    fig.update_traces(
+        textposition='outside',
+        hovertemplate='<b>%{y}</b>: %{x} reseñas negativas<extra></extra>')
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title='Reseñas negativas que mencionan el tema',
+        yaxis_title='',
+    )
+    # Ritmo de la animación (ms por frame) y transición suave entre bandas
+    fig.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 1100
+    fig.layout.updatemenus[0].buttons[0].args[1]['transition']['duration'] = 500
+    fig.layout.sliders[0].currentvalue['prefix'] = 'Banda de horas: '
+    return style_fig(fig, height=480,
+                     title='Evolución de las quejas de fricción conforme avanza la partida')
+
+
+def build_choropleth(df):
+    """Mapa coroplético interactivo de reseñas negativas por idioma (cell 31
+    del notebook usa GeoPandas; aquí Plotly trae las geometrías integradas,
+    sin descargar GeoJSON, con zoom y tooltips)."""
     neg_df = df[df['recommended'] == False]  # noqa: E712
     neg_lang = neg_df.copy()
     neg_lang['iso'] = neg_lang['language'].map(LANG_TO_ISO)
     neg_lang = neg_lang.dropna(subset=['iso'])
-    lang_counts = neg_lang.groupby('iso').size().reset_index(name='neg_reviews')
+    lang_counts = (neg_lang.groupby(['iso', 'language']).size()
+                   .reset_index(name='neg_reviews'))
 
-    world = gpd.read_file(WORLD_GEOJSON_URL)
-    world = world.rename(columns={'iso_a3': 'iso'})
-    merged = world.merge(lang_counts, on='iso', how='left')
-
-    fig, ax = plt.subplots(figsize=(15, 8))
-    world.plot(ax=ax, color='#f0f0f0', edgecolor='#cccccc', linewidth=0.3)
-    merged[merged['neg_reviews'].notna()].plot(
-        ax=ax, column='neg_reviews', cmap='YlOrRd',
-        legend=True,
-        legend_kwds={'label': 'Negative reviews (by review language)',
-                     'shrink': 0.5},
-        edgecolor='#cccccc', linewidth=0.3,
+    fig = px.choropleth(
+        lang_counts,
+        locations='iso',
+        color='neg_reviews',
+        hover_name='language',
+        color_continuous_scale='YlOrRd',
+        labels={'neg_reviews': 'Reseñas negativas'},
     )
-    ax.set_title('Geographic distribution of negative reviews\n'
-                 '(mapped by review language to representative country)',
-                 fontsize=12, fontweight='bold')
-    ax.axis('off')
-    fig.text(0.5, 0.02,
-             'Note: language mapped to a single representative country — '
-             'English→USA, Spanish→Spain, etc. This is an approximation.',
-             ha='center', fontsize=8, color='grey')
-    plt.tight_layout()
-    return fig
+    fig.update_traces(
+        marker_line_color='rgba(255,255,255,0.2)', marker_line_width=0.4,
+        hovertemplate='<b>%{hovertext}</b> → %{location}<br>'
+                      '%{z} reseñas negativas<extra></extra>')
+    fig.update_geos(
+        bgcolor='rgba(0,0,0,0)',
+        showframe=False,
+        showcoastlines=False,
+        landcolor='#23262E',
+        oceancolor='rgba(0,0,0,0)',
+        showocean=True,
+        projection_type='natural earth',
+    )
+    fig.update_layout(coloraxis_colorbar=dict(title='Negativas', len=0.7))
+    return style_fig(
+        fig, height=520,
+        title='Distribución geográfica de reseñas negativas '
+              '(idioma → país representativo, aproximación)')
 
 
 def chart_scatter_merge_validation(df):
@@ -550,36 +764,42 @@ def chart_scatter_merge_validation(df):
         / (game_scatter['global_pos'] + game_scatter['global_neg']) * 100
     )
 
-    fig, ax = plt.subplots(figsize=(11, 7))
-    sc = ax.scatter(game_scatter['global_neg_pct'],
-                    game_scatter['sample_neg_rate'],
-                    c=game_scatter['price'], cmap='viridis', s=140,
-                    edgecolor='white', linewidth=0.8, zorder=3)
-    fig.colorbar(sc, ax=ax, label='Precio actual (USD, games.csv)', shrink=0.8)
-
     lim = max(game_scatter['global_neg_pct'].max(),
               game_scatter['sample_neg_rate'].max()) * 1.1
-    ax.plot([0, lim], [0, lim], color='grey', linestyle='--',
-            linewidth=1, zorder=1)
-    ax.text(lim * 0.72, lim * 0.78, 'reseñas recientes peores\nque la historia global',
-            fontsize=8, color='grey', ha='center')
-    ax.text(lim * 0.78, lim * 0.55, 'reseñas recientes mejores\nque la historia global',
-            fontsize=8, color='grey', ha='center')
 
-    for _, row in game_scatter.iterrows():
-        ax.annotate(row['game_name'],
-                    (row['global_neg_pct'], row['sample_neg_rate']),
-                    textcoords='offset points', xytext=(6, 4), fontsize=7.5)
-
-    ax.set_title('Validación cruzada: % negativo global (games.csv) vs. '
-                 '% negativo en la muestra (API)\n'
-                 'Color = precio — tres columnas que solo existen gracias al merge por appid',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('% de votos negativos globales del juego (games.csv, todo su historial)')
-    ax.set_ylabel('% de reseñas negativas en la muestra (API, reseñas recientes)')
-    ax.spines[['top', 'right']].set_visible(False)
-    plt.tight_layout()
-    return fig
+    fig = px.scatter(
+        game_scatter,
+        x='global_neg_pct', y='sample_neg_rate',
+        color='price', color_continuous_scale='viridis',
+        text='game_name',
+        labels={'price': 'Precio (USD)'},
+        custom_data=['game_name', 'price'],
+    )
+    fig.update_traces(
+        marker=dict(size=14, line=dict(color='rgba(255,255,255,0.7)', width=1)),
+        textposition='top center',
+        textfont=dict(size=9, color='#9AA0AB'),
+        hovertemplate=('<b>%{customdata[0]}</b><br>'
+                       'Global (games.csv): %{x:.1f}% negativas<br>'
+                       'Muestra (API): %{y:.1f}% negativas<br>'
+                       'Precio: $%{customdata[1]:.2f}<extra></extra>'),
+    )
+    fig.add_shape(type='line', x0=0, y0=0, x1=lim, y1=lim,
+                  line=dict(color='rgba(255,255,255,0.3)', dash='dash', width=1))
+    fig.add_annotation(x=lim * 0.70, y=lim * 0.86, showarrow=False,
+                       text='reseñas recientes<br>peores que la historia',
+                       font=dict(size=10, color='#9AA0AB'))
+    fig.add_annotation(x=lim * 0.86, y=lim * 0.55, showarrow=False,
+                       text='reseñas recientes<br>mejores que la historia',
+                       font=dict(size=10, color='#9AA0AB'))
+    fig.update_layout(
+        xaxis_title='% votos negativos globales (games.csv, todo el historial)',
+        yaxis_title='% reseñas negativas en la muestra (API, recientes)',
+        coloraxis_colorbar=dict(title='Precio<br>(USD)'),
+    )
+    return style_fig(fig, height=560,
+                     title='Validación cruzada: % negativo global vs. muestra '
+                           '(color = precio, tres columnas del merge)')
 
 
 @st.cache_data(show_spinner="Generando nube de palabras…")
@@ -596,14 +816,16 @@ def build_wordcloud(df):
     final_stop_words = STOPWORDS.union(STOP_WORDS).union(custom_stops)
     wc = WordCloud(
         width=800, height=400,
-        background_color='black', colormap='Reds',
+        background_color='#14161B', colormap='Reds',
         stopwords=final_stop_words, max_words=100,
     ).generate(neg_text)
 
     fig, ax = plt.subplots(figsize=(12, 6))
+    fig.patch.set_alpha(0)  # se integra con el fondo oscuro de la app
     ax.imshow(wc, interpolation='bilinear')
     ax.axis('off')
-    ax.set_title('Conceptos Dominantes en Reseñas Negativas', fontsize=16)
+    ax.set_title('Conceptos Dominantes en Reseñas Negativas',
+                 fontsize=16, color='#E8EAED')
     plt.tight_layout()
     return fig
 
@@ -618,6 +840,19 @@ page = st.sidebar.radio(
 )
 st.sidebar.markdown("---")
 df = build_master()
+
+# Filtro global de juegos: alimenta todo el Dashboard en vivo.
+# Vacío = los 24 juegos (evita llenar la barra lateral de chips).
+ALL_GAMES = sorted(df['game_name'].unique())
+selected_games = st.sidebar.multiselect(
+    "🎮 Filtrar juegos",
+    options=ALL_GAMES,
+    default=[],
+    placeholder="Todos los juegos",
+    help="Filtra todas las gráficas del Dashboard. Vacío = todos.",
+)
+df_dash = df[df['game_name'].isin(selected_games)] if selected_games else df
+
 neg_df = df[df['recommended'] == False]  # noqa: E712
 crosstab, crosstab_pct, band_totals = friction_crosstabs(df)
 st.sidebar.caption(
@@ -670,7 +905,16 @@ if page == "🏠 Inicio":
         .assign(pct_negativas=lambda d: (d.negativas / d.reseñas * 100).round(1))
         .sort_values('pct_negativas', ascending=False)
     )
-    st.dataframe(games_table, width='stretch')
+    st.dataframe(
+        games_table, width='stretch',
+        column_config={
+            'pct_negativas': st.column_config.ProgressColumn(
+                '% negativas', format='%.1f%%',
+                min_value=0, max_value=float(games_table['pct_negativas'].max()),
+            ),
+            'mediana_horas': st.column_config.NumberColumn(
+                'mediana horas', format='%.1f h'),
+        })
 
 # =============================================================================
 # 🧪 METODOLOGÍA
@@ -743,6 +987,82 @@ elif page == "🧪 Metodología":
 # =============================================================================
 elif page == "📊 Dashboard":
     st.title("📊 Dashboard — Análisis visual")
+    if selected_games:
+        st.caption("Filtrado a " + ", ".join(selected_games))
+
+    # -------------------------------------------------------------------------
+    # Estadísticas acumuladas — encabezado interactivo estilo "Cumulative Stats"
+    # -------------------------------------------------------------------------
+    dates = df_dash['date_created'].dt.date
+    min_d, max_d = dates.min(), dates.max()
+
+    c1, c2, c3, c4 = st.columns(4)
+    start_date = c1.date_input("Fecha inicial", value=min_d,
+                               min_value=min_d, max_value=max_d)
+    end_date = c2.date_input("Fecha final", value=max_d,
+                             min_value=min_d, max_value=max_d)
+    freq_label = c3.selectbox("Granularidad", ["Mensual", "Semanal", "Diaria"])
+    chart_kind = c4.selectbox("Tipo de gráfico", ["Barras", "Área", "Línea"])
+
+    if start_date > end_date:
+        st.warning("La fecha inicial es posterior a la final.")
+    else:
+        in_window = (dates >= start_date) & (dates <= end_date)
+        window = df_dash[in_window]
+
+        # Periodo anterior de igual duración → deltas de las métricas
+        span = end_date - start_date
+        prev_start = start_date - span - timedelta(days=1)
+        prev_end = start_date - timedelta(days=1)
+        prev = df_dash[(dates >= prev_start) & (dates <= prev_end)]
+
+        freq = {"Mensual": "MS", "Semanal": "W", "Diaria": "D"}[freq_label]
+        date_fmt = '%b %Y' if freq_label == "Mensual" else '%d %b %Y'
+        wi = window.set_index('date_created').sort_index()
+        cum_reviews = wi['review_id'].resample(freq).count().cumsum()
+        cum_negatives = (~wi['recommended']).resample(freq).sum().cumsum()
+        cum_hours = wi['playtime_at_review_hrs'].resample(freq).sum().cumsum()
+        cum_friction = (wi[list(FRICTION_TAGS)].any(axis=1)
+                        .resample(freq).sum().cumsum())
+
+        cards = [
+            ("Reseñas", len(window), len(prev),
+             'normal', ACCENT['blue'], cum_reviews, 'reseñas'),
+            ("Reseñas negativas",
+             int((~window['recommended']).sum()),
+             int((~prev['recommended']).sum()),
+             'inverse', ACCENT['orange'], cum_negatives, 'negativas'),
+            ("Horas jugadas",
+             window['playtime_at_review_hrs'].sum(),
+             prev['playtime_at_review_hrs'].sum(),
+             'normal', ACCENT['pink'], cum_hours, 'horas'),
+            ("Menciones de fricción",
+             int(window[list(FRICTION_TAGS)].any(axis=1).sum()),
+             int(prev[list(FRICTION_TAGS)].any(axis=1).sum()),
+             'inverse', ACCENT['purple'], cum_friction, 'menciones'),
+        ]
+        for col, (label, val, prev_val, dcolor, color, series, unit) in zip(
+                st.columns(4), cards):
+            with col:
+                # Sin periodo previo comparable (rango completo) no hay delta
+                st.metric(
+                    label, f"{val:,.0f}",
+                    delta=f"{val - prev_val:+,.0f}" if len(prev) else None,
+                    delta_color=dcolor,
+                    help=(f"Cambio vs. el periodo anterior de igual duración "
+                          f"({prev_start:%d %b %Y} – {prev_end:%d %b %Y})"),
+                )
+                st.plotly_chart(
+                    mini_cumulative_chart(series, color, chart_kind,
+                                          unit, date_fmt),
+                    width='stretch', key=f"mini_{unit}")
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------------
+    # Gráficas interactivas — todas reaccionan al filtro de juegos del sidebar
+    # -------------------------------------------------------------------------
+    crosstab_f, crosstab_pct_f, band_totals_f = friction_crosstabs(df_dash)
 
     tab_names = [
         "1· Histograma", "2· Tasa negativa", "3· Curvas de abandono",
@@ -756,53 +1076,50 @@ elif page == "📊 Dashboard":
         st.markdown("**Distribución de horas jugadas al reseñar** — la "
                     "divergencia entre poblaciones revela la ventana donde la "
                     "fricción se vuelve decisiva.")
-        st.pyplot(chart_playtime_histogram(df))
+        st.plotly_chart(chart_playtime_histogram(df_dash), width='stretch')
 
     with tabs[1]:
         st.markdown("**Tasa de reseñas negativas por banda de horas** — el "
                     "patrón de abandono en su forma más directa.")
-        st.pyplot(chart_negative_rate_by_band(df))
+        st.plotly_chart(chart_negative_rate_by_band(df_dash), width='stretch')
 
     with tabs[2]:
         st.markdown("**Acumulación de reseñas según horas jugadas** — una "
                     "subida temprana pronunciada implica más jugadores que "
                     "reseñan (y abandonan) pronto.")
-        st.pyplot(chart_abandonment_curves(df))
+        st.plotly_chart(chart_abandonment_curves(df_dash), width='stretch')
 
     with tabs[3]:
         st.markdown("**Horas jugadas según sentimiento** — mediana, dispersión "
-                    "y outliers en un solo gráfico (Seaborn boxplot).")
-        st.pyplot(chart_boxplot_sentiment(df))
+                    "y outliers en un solo gráfico interactivo.")
+        st.plotly_chart(chart_boxplot_sentiment(df_dash), width='stretch')
 
     with tabs[4]:
-        st.markdown("**Temas de fricción × banda de horas** (Seaborn heatmap) "
-                    "— % de reseñas negativas *en inglés* de cada banda que "
-                    "mencionan cada tema (las regex de fricción son en inglés).")
-        st.pyplot(chart_friction_heatmap(crosstab_pct, band_totals))
+        st.markdown("**Temas de fricción × banda de horas** — % de reseñas "
+                    "negativas *en inglés* de cada banda que mencionan cada "
+                    "tema (las regex de fricción son en inglés).")
+        st.plotly_chart(chart_friction_heatmap(crosstab_pct_f, band_totals_f),
+                        width='stretch')
 
     with tabs[5]:
-        st.markdown("**Forma de la distribución de horas por juego** "
-                    "(Seaborn KDE) — juegos con perfiles de abandono "
-                    "contrastantes.")
-        st.pyplot(chart_kde_playtime(df))
+        st.markdown("**Forma de la distribución de horas por juego** (KDE) — "
+                    "juegos con perfiles de abandono contrastantes.")
+        st.plotly_chart(chart_kde_playtime(df_dash), width='stretch')
 
     with tabs[6]:
-        st.markdown("**Animación**: evolución de las quejas de fricción "
-                    "conforme avanza la partida (Matplotlib FuncAnimation, "
-                    "exportada a GIF).")
-        gif_path = build_animation_gif(crosstab)
-        st.image(gif_path)
+        st.markdown("**Animación interactiva**: pulsa ▶ para recorrer cómo "
+                    "evolucionan las quejas de fricción conforme avanza la "
+                    "partida. La versión Matplotlib (FuncAnimation → GIF) del "
+                    "rúbrico está en el notebook y en el desplegable.")
+        st.plotly_chart(chart_friction_animated(crosstab_f), width='stretch')
+        with st.expander("Ver GIF generado con Matplotlib (FuncAnimation)"):
+            st.image(build_animation_gif(crosstab))
 
     with tabs[7]:
-        st.markdown("**Mapa coroplético (GeoPandas)** — reseñas negativas por "
-                    "idioma, asignadas a un país representativo.")
-        try:
-            st.pyplot(build_choropleth(df))
-        except Exception as exc:
-            st.warning(
-                "No se pudo construir el mapa (se necesita conexión a "
-                f"internet para descargar el GeoJSON mundial): {exc}"
-            )
+        st.markdown("**Mapa coroplético interactivo** — reseñas negativas por "
+                    "idioma, asignadas a un país representativo (la versión "
+                    "GeoPandas del rúbrico vive en el notebook).")
+        st.plotly_chart(build_choropleth(df_dash), width='stretch')
 
     with tabs[8]:
         st.markdown("**Validación cruzada de la muestra (el valor del merge)** "
@@ -811,17 +1128,29 @@ elif page == "📊 Dashboard":
                     "(API). La diagonal = acuerdo perfecto; arriba de la línea "
                     "= sentimiento reciente peor que el histórico. "
                     "Color = precio. Tres columnas del merge en un solo gráfico.")
-        st.pyplot(chart_scatter_merge_validation(df))
+        st.plotly_chart(chart_scatter_merge_validation(df_dash), width='stretch')
 
     with tabs[9]:
         st.markdown("**Análisis de texto en reseñas negativas en inglés** — "
                     "frases más repetidas (trigramas, NLTK) y nube de palabras.")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.dataframe(negative_phrases(df, n=3, top_k=25),
-                         width='stretch', hide_index=True)
-        with col2:
-            st.pyplot(build_wordcloud(df))
+        eng_neg = df_dash[(df_dash['recommended'] == False)  # noqa: E712
+                          & (df_dash['language'] == 'english')]
+        if eng_neg.empty:
+            st.info("No hay reseñas negativas en inglés con el filtro actual.")
+        else:
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                phrases = negative_phrases(df_dash, n=3, top_k=25)
+                st.dataframe(
+                    phrases, width='stretch', hide_index=True,
+                    column_config={
+                        'Apariciones': st.column_config.ProgressColumn(
+                            'Apariciones', format='%d', min_value=0,
+                            max_value=int(phrases['Apariciones'].max()),
+                        ),
+                    })
+            with col2:
+                st.pyplot(build_wordcloud(df_dash))
 
 # =============================================================================
 # 📝 CONCLUSIONES
